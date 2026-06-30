@@ -1,0 +1,40 @@
+name: 每日A股双体系分析推送
+
+on:
+  schedule:
+    # 北京时间 16:00 = UTC 08:00，周一至周五
+    - cron: '0 8 * * 1-5'
+  workflow_dispatch:          # 手动触发
+
+jobs:
+  analyze-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      TZ: Asia/Shanghai
+      SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install akshare requests pandas
+
+      - name: 淘股吧+欧特龙双体系分析 & Server酱推送
+        run: python market_push.py --push serverchan
+
+      - name: 留存报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report-${{ github.run_id }}
+          path: reports/
+          retention-days: 30
