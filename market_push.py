@@ -468,6 +468,131 @@ def analyze_oute(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _rank_dynamic_candidates(data: dict) -> dict:
+    """根据当日涨停池生成动态候选股，避免报告使用固定股票名单。
+
+    这里仅使用涨停池中已有的字段，不把候选股伪装成实时买入信号。
+    返回值同时供“重点观察池”和“明日买入建议”使用，保证两处口径一致。
+    """
+    lb = data.get("limit_up_board")
+    empty = {"industries": [], "watch": [], "buy": [], "avoid": []}
+    if lb is None or getattr(lb, "empty", True):
+        return empty
+
+    required = {"名称", "代码", "连板数"}
+    if not required.issubset(set(lb.columns)):
+        return empty
+
+    df = lb.copy()
+    # AkShare 字段可能包含字符串、空值或带百分号的文本，统一成可排序数值。
+    for col in ("连板数", "换手率", "成交额"):
+        if col in df.columns:
+            df[col] = (
+                df[col].astype(str).str.replace("%", "", regex=False)
+                .str.replace(",", "", regex=False)
+            )
+            df[col] = __import__("pandas").to_numeric(df[col], errors="coerce").fillna(0)
+        else:
+            df[col] = 0
+    if "所属行业" not in df.columns:
+        df["所属行业"] = "未分类"
+    df["所属行业"] = df["所属行业"].fillna("未分类").astype(str)
+    df["名称"] = df["名称"].fillna("未知").astype(str)
+    df["代码"] = df["代码"].fillna("").astype(str).str.replace(".0", "", regex=False)
+
+    industry_counts = df["所属行业"].value_counts()
+    top_industries = list(industry_counts.head(3).index)
+    df["板块涨停数"] = df["所属行业"].map(industry_counts).fillna(1)
+    # 板块效应、连板高度、成交额和适度换手共同构成候选排序。
+    turnover_score = df["换手率"].clip(lower=0, upper=30) / 30
+    volume_score = df["成交额"].rank(pct=True).fillna(0)
+    df["评分"] = (
+        df["板块涨停数"].clip(upper=10) * 2
+        + df["连板数"].clip(upper=7) * 2
+        + turnover_score
+        + volume_score
+    )
+
+    def row_to_item(row, reason, action):
+        code = str(row["代码"]).zfill(6)
+        return {
+            "name": row["名称"],
+            "code": code,
+            "industry": row["所属行业"],
+            "boards": int(row["连板数"]),
+            "turnover": float(row["换手率"]),
+            "amount": float(row["成交额"]),
+            "sector_count": int(row["板块涨停数"]),
+            "reason": reason,
+            "action": action,
+        }
+
+    watch = []
+    buy = []
+    for industry in top_industries:
+        sector = df[df["所属行业"] == industry].sort_values(
+            ["评分", "连板数", "成交额"], ascending=False
+        )
+        # 每个强势板块最多选两只：一只高度票、一只低位首板/二板。
+        selected = []
+        high = sector.iloc[0] if len(sector) else None
+        low = sector[sector["连板数"].isin([1, 2])].iloc[0] if not sector[
+            sector["连板数"].isin([1, 2])
+        ].empty else None
+        for row in (high, low):
+            if row is not None and str(row["代码"]) not in [x["code"] for x in selected]:
+                selected.append(row_to_item(
+                    row,
+                    f"{industry}涨停{int(row['板块涨停数'])}只，{int(row['连板数'])}板",
+                    "竞价/分歧转一致确认",
+                ))
+        watch.extend(selected)
+        # 买入建议优先放低位换手票，避免把所有最高标都当成买点。
+        for item in selected:
+            if item["boards"] in (1, 2) and item["turnover"] <= 65:
+                buy.append(item)
+
+    # 候选不足时，从全市场补充评分最高的低位票；不再写死股票名称。
+    if len(buy) < 3:
+        low_df = df[df["连板数"].isin([1, 2]) & (df["换手率"] <= 65)].sort_values(
+            "评分", ascending=False
+        )
+        for _, row in low_df.iterrows():
+            item = row_to_item(
+                row,
+                f"{row['所属行业']}板块涨停{int(row['板块涨停数'])}只",
+                "竞价超预期且上板确认",
+            )
+            if item["code"] not in [x["code"] for x in buy]:
+                buy.append(item)
+            if len(buy) >= 5:
+                break
+
+    # 明确列出不适合追涨的高换手/高位标的，增强报告解释性。
+    avoid_df = df[(df["连板数"] >= 3) & (df["换手率"] > 65)].sort_values(
+        "换手率", ascending=False
+    )
+    avoid = [
+        row_to_item(row, "高位且换手率超过65%", "回避追高")
+        for _, row in avoid_df.head(3).iterrows()
+    ]
+    return {
+        "industries": top_industries,
+        "watch": watch[:8],
+        "buy": buy[:5],
+        "avoid": avoid,
+    }
+
+
+def _candidate_line(item):
+    """将动态候选转换为简洁的报告文本。"""
+    return (
+        f"{item['name']}({item['code']}) | {item['industry']} | "
+        f"{item['boards']}板 | 板块{item['sector_count']}只 | "
+        f"换手{item['turnover']:.1f}%"
+    )
+
+
 def generate_tomorrow_plan(data: dict) -> str:
     """生成明日操作预案"""
     lines = []
@@ -532,6 +657,8 @@ def generate_tomorrow_plan(data: dict) -> str:
             lines.append(f"```")
             lines.append("")
 
+    candidates = _rank_dynamic_candidates(data)
+
     # --- 具体操作计划 ---
     lines.append("### 操作计划")
     lines.append("")
@@ -542,8 +669,8 @@ def generate_tomorrow_plan(data: dict) -> str:
     if change_pct < -0.5 and total_zt < 60:
         plan = "**防守为主，试错为辅**"
         detail = [
-            "1. 竞价9:20-9:25观察零售/消费首板是否弱转强",
-            "2. 出现竞价爆量抢筹→打1进2确认板(仓位30%)",
+            "1. 竞价9:20-9:25观察下方候选是否出现弱转强",
+            "2. 出现竞价爆量抢筹→只做1进2确认板(仓位30%)",
             "3. 无模式票→空仓等待，不见兔子不撒鹰",
             "4. 高位龙头只做T不做新开仓",
         ]
@@ -567,9 +694,13 @@ def generate_tomorrow_plan(data: dict) -> str:
     lines.append("")
     lines.append("| 优先级 | 标的 | 逻辑 | 买点 |")
     lines.append("|--------|------|------|------|")
-    lines.append("| 🥇 | 零售首板(东百/步步高) | 断板节点新主线娇妻 | 竞价弱转强→打1进2 |")
-    lines.append("| 🥈 | 电力补涨首板 | 电力5板高度+补涨空间 | 分歧转一致确认 |")
-    lines.append("| 🥉 | 总龙(华电能源) | 高位缠斗T+0 | 均线低吸/分歧低吸 |")
+    for rank, item in enumerate(candidates["watch"][:3], 1):
+        medal = ["🥇", "🥈", "🥉"][rank - 1]
+        lines.append(
+            f"| {medal} | {_candidate_line(item)} | {item['reason']} | {item['action']} |"
+        )
+    if not candidates["watch"]:
+        lines.append("| - | 暂无符合条件的动态候选 | 当日涨停池数据不足或字段不完整 | 空仓观察 |")
     lines.append("")
 
     # --- 风控 ---
@@ -592,22 +723,34 @@ def generate_buy_recommendation(data: dict) -> str:
     lines.append("## 💰 四、明日买入建议")
     lines.append("")
 
-    # 基于数据分析推荐
+    candidates = _rank_dynamic_candidates(data)
+
+    # 基于当日涨停池动态生成推荐，不再使用固定股票名单。
     lines.append("### 🥇 第一优先级：1进2确认板(新生娇妻)")
     lines.append("")
     lines.append("| 排序 | 标的 | 代码 | 逻辑 | 买点策略 |")
     lines.append("|------|------|------|------|----------|")
-    lines.append("| **1** | **东百集团** | 600693 | 零售辨识度最高+图形性感+冰点断板娇妻 | 竞价爆量→半路一笔；上板→打板加仓 |")
-    lines.append("| **2** | **步步高** | 002251 | 零售妖股记忆+成交15.8亿容量+换手充分 | 竞价高开3-7%+量比>2→半路+打板 |")
-    lines.append("| 3 | 深南电A | 000037 | 电力补涨+换手9.3%健康+深圳 | 分歧转一致确认后半路 |")
+    for rank, item in enumerate(candidates["buy"], 1):
+        lines.append(
+            f"| **{rank}** | **{item['name']}** | {item['code']} | "
+            f"{item['reason']} | {item['action']} |"
+        )
+    if not candidates["buy"]:
+        lines.append("| - | 暂无符合条件的动态候选 | 数据不足/没有合适的1-2板标的 | 不交易 |")
     lines.append("")
 
     lines.append("### 🥈 第二优先级：总龙缠斗(防守配置)")
     lines.append("")
     lines.append("| 标的 | 代码 | 策略 | 条件 |")
     lines.append("|------|------|------|------|")
-    lines.append("| 华电能源 | 600726 | 均线低吸做T | 换手<55%安全区+非跌停 |")
-    lines.append("| 粤电力A | 000539 | 5日线低吸 | 板块未退潮+缩量企稳 |")
+    for item in candidates["watch"]:
+        if item["boards"] >= 3 and item["turnover"] <= 65:
+            lines.append(
+                f"| {item['name']} | {item['code']} | 分歧低吸/均线做T | "
+                f"{item['industry']}板块未退潮，换手{item['turnover']:.1f}% |"
+            )
+    if not any(item["boards"] >= 3 and item["turnover"] <= 65 for item in candidates["watch"]):
+        lines.append("| 暂无 | - | 不开高位新仓 | 等待动态候选出现 |")
     lines.append("")
 
     lines.append("### ⛔ 明确回避")
@@ -616,6 +759,8 @@ def generate_buy_recommendation(data: dict) -> str:
     lines.append("- 高位断板品种(不接飞刀)")
     lines.append("- 无板块效应的独立走强(穿越十穿九死)")
     lines.append("- 换手率>65%的高位票(死亡分界线)")
+    for item in candidates["avoid"]:
+        lines.append(f"- {item['name']}({item['code']})：{item['reason']}")
     lines.append("")
 
     lines.append("> ⚠️ **免责声明**：以上分析仅供学习交流，不构成投资建议。股市有风险，投资需谨慎。")
